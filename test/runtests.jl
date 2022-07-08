@@ -1,6 +1,8 @@
 using SUPGChannel
 using Test
 
-@testset "SUPGChannel.jl" begin
-    channelflow()
-end
+
+# @time channelflow()
+nls = SUPGChannel.DummyNLS(Ref{Any}())
+channelflow(;nls)
+

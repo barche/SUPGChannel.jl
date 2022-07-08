@@ -34,7 +34,16 @@ function boundaryconditions(u0, periodic)
    return u_diri_tags,p_diri_tags,u_diri_values,p_diri_values
 end
 
-function channelflow(;u0=1.0, N=32::Integer, h=1.0, writemodel=false, periodic=true, order = 1)
+struct DummyNLS <: Gridap.Algebra.NonlinearSolver
+   op::Ref{Any}
+end
+function Gridap.Algebra.solve!(x::AbstractVector,nls::DummyNLS,op::Gridap.Algebra.NonlinearOperator,cache::Nothing)
+   nls.op[] = op
+   benchmark_assembly(op)
+   cache
+end
+
+function channelflow(;u0=1.0, N=32::Integer, h=1.0, writemodel=false, periodic=true, order = 1, nls = NLSolver(show_trace=true, method=:newton, linesearch=MoreThuente(), iterations=30))
    ν = 1.0 # Kinematic vicosity
    body_force = periodic ? 2*ν*u0/h^2 : 0.0
 
@@ -88,28 +97,32 @@ function channelflow(;u0=1.0, N=32::Integer, h=1.0, writemodel=false, periodic=t
    hf(x, t::Real) = VectorValue(body_force, 0)
    hf(t::Real) = x -> hf(x, t)
 
+   # res(t, (u, p), (v, q)) = ∫(
+   #    q ⊙ (∇⋅u) + (τ∘(u,h)) * ∇(q) ⊙ (u⋅∇(u)) +
+   #    (τ∘(u,h)) * (∇(q) ⊙ ∇(p)) +
+   #    ν * ∇(v) ⊙ ∇(u) + (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ (u⋅∇(u)) +
+   #    (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ ∇(p) +
+   #    (τb∘(u,h)) * (∇⋅v) ⊙ (∇⋅u) +
+   #    (τ∘(u,h)) * ∇(q) ⊙ ∂t(u) +
+   #    (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ ∂t(u) -
+   #    (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ hf(t)
+   # )dΩ
+
    res(t, (u, p), (v, q)) = ∫(
-      q ⊙ (∇⋅u) + (τ∘(u,h)) * ∇(q) ⊙ (u⋅∇(u)) +
-      (τ∘(u,h)) * (∇(q) ⊙ ∇(p)) +
-      ν * ∇(v) ⊙ ∇(u) + (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ (u⋅∇(u)) +
-      (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ ∇(p) +
-      (τb∘(u,h)) * (∇⋅v) ⊙ (∇⋅u) +
-      (τ∘(u,h)) * ∇(q) ⊙ ∂t(u) +
-      (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ ∂t(u) +
-      (v + (τ∘(u,h)) * u⋅∇(u)) ⊙ hf(t)
+      (q + (τb∘(u,h)) * (∇⋅v)) ⊙ (∇⋅u) +
+      (v + (τ∘(u,h)) * (∇(q) + u⋅∇(u))) ⊙ (∂t(u) + u⋅∇(u) + ∇(p) - hf(t)) +
+      ν * ∇(v) ⊙ ∇(u)
    )dΩ
 
    op = TransientFEOperator(res, X, Y)
 
-   nls = NLSolver(show_trace=true, method=:newton, linesearch=MoreThuente(), iterations=30)
+   
 
    U0 = U(0.0)
    P0 = P(0.0)
    X0 = X(0.0)
 
-   u_in_v(x, t::Real) = VectorValue(u0, 0.0)
-   u_in_v(t::Real) = x -> u_in_v(x, t)
-   uh0 = interpolate_everywhere(u_in_v(0), U0)
+   uh0 = interpolate_everywhere(VectorValue(0.0, 0.0), U0)
    ph0 = interpolate_everywhere(0.0, P0)
    xh0 = interpolate_everywhere([uh0, ph0], X0)
 
@@ -122,7 +135,6 @@ function channelflow(;u0=1.0, N=32::Integer, h=1.0, writemodel=false, periodic=t
 
    ode_solver = ThetaMethod(nls, dt, θ)
 
-
    sol_t = solve(ode_solver, op, xh0, t0, tend)
 
    for (i,(xh_tn, _)) in enumerate(sol_t)
@@ -130,16 +142,19 @@ function channelflow(;u0=1.0, N=32::Integer, h=1.0, writemodel=false, periodic=t
    end
 end
 
-function benchmark_assembly()
+function benchmark_assembly(top)
+   op = top.odeop.feop
+   U = evaluate(Gridap.FESpaces.get_trial(op),nothing)
+   V = Gridap.FESpaces.get_test(op)
    du = get_trial_fe_basis(U)
-   dv = get_fe_basis(V)
-   uhd = zero(U)
-   data = collect_cell_matrix_and_vector(U,V,a,l,uhd)
+   v = get_fe_basis(V)
+   uh = zero(U)
+   data = collect_cell_matrix_and_vector(U,V,op.jac(uh,du,v),op.res(uh,v))
    Tm = SparseMatrixCSC{Float64,Int32}
    Tv = Vector{Float64}
    assem = SparseMatrixAssembler(Tm,Tv,U,V)
-   A, b = assemble_matrix_and_vector(assem,data) # This is the assembly loop + allocation and compression of the matrix
-   assemble_matrix_and_vector!(A,b,assem,data) # This is the in-place assembly loop on a previously allocated matrix/vector.
+   @time A, b = assemble_matrix_and_vector(assem,data) # This is the assembly loop + allocation and compression of the matrix
+   @time assemble_matrix_and_vector!(A,b,assem,data) # This is the in-place assembly loop on a previously allocated matrix/vector.
 end
 
 # Simplified version of Carlo Brunell's mesh_channel (2D and serial only)
@@ -150,27 +165,13 @@ function makemesh(;h=1,N=32::Integer, writemodel=false, periodic=true)
   nx = N
   ny = N
 
-
-  #N = 32 # Partition (i.e., number of cells per space dimension)
-  function stretching(x::Point)
-     m = zeros(length(x))
-     m[1] = x[1]
-
-     gamma1 = 2.5
-     m[2] = -tanh(gamma1 * (x[2])) / tanh(gamma1)
-     if length(x) > 2
-        m[3] = x[3]
-     end
-     Point(m)
-  end
-
-  pmin = Point(0, -Ly / 2)
-  pmax = Point(Lx, Ly / 2)
+  pmin = Point(0, 0)
+  pmax = Point(Lx, Ly)
   partition = (nx, ny)
   periodic_tuple = (periodic, false)
   model_name = "channel"
 
-  model = CartesianDiscreteModel(pmin, pmax, partition, map=stretching, isperiodic=periodic_tuple)
+  model = CartesianDiscreteModel(pmin, pmax, partition, isperiodic=periodic_tuple)
 
   if writemodel
      writevtk(model, model_name)
